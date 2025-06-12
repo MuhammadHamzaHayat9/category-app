@@ -1,0 +1,2768 @@
+from dash import dcc, html, Input, Output, State, ctx, MATCH, ALL, Dash
+from dash.exceptions import PreventUpdate
+import dataiku
+import pandas as pd
+import numpy as np
+import datetime
+from datetime import time, timedelta
+from functools import lru_cache
+import json
+from collections import deque, defaultdict
+import bisect
+import plotly.graph_objs as go
+import traceback
+import math
+
+# Configuration Management
+CONFIG = {
+    "datasets": {
+        "original": "Rolling_events",
+        "managed": "rolling_new"
+    },
+    "columns": {
+        "match": "Composite_key",
+        "timestamp": "StartTime EST",
+        "end_timestamp": "EndTime EST",
+        "null_timestamp": "9999-12-31"
+    },
+    "shifts": {
+        "A": {"start": 6, "end": 18, "color": "#3498DB", "name": "Day Shift"},
+        "B": {"start": 18, "end": 6, "color": "#34495E", "name": "Night Shift"}
+    },
+    "intervals": {
+        "auto_save": 1800000,  # 30 minutes
+        "auto_refresh": 300000  # 5 minutes
+    },
+    "validation": {
+        "min_event_duration_for_warning": 30,
+        "allocation_warning_threshold": 0.8,
+        "over_allocation_tolerance": 1.1  # 10% tolerance
+    },
+    "ui": {
+        "max_history_size": 50,
+        "table_max_height": "calc(80vh - 20px)",
+        "header_height": "20vh"
+    }
+}
+
+# Event Categories with updated colors
+EVENT_CATEGORIES = [
+    {"label": "Curing", "value": "E31", "color": "#3498DB", "icon": "🔥"},
+    {"label": "OPEN", "value": "C2", "color": "#E74C3C", "icon": "🚪"},
+    {"label": "Misc.", "value": "G3", "color": "#95A5A6", "icon": "📋"},
+    {"label": "NT (No Tires)", "value": "E32", "color": "#F39C12", "icon": "🚫"},
+    {"label": "NOT (Not Trucked)", "value": "E3", "color": "#E67E22", "icon": "🚚"},
+    {"label": "CNC", "value": "F13", "color": "#9B59B6", "icon": "🔧"},
+    {"label": "R/S off", "value": "C2-RS", "color": "#16A085", "icon": "➡️"},
+    {"label": "L/S off", "value": "C2-LS", "color": "#27AE60", "icon": "⬅️"},
+    {"label": "BC (Bladder Change)", "value": "F2", "color": "#2980B9", "icon": "🔄"},
+    {"label": "CO (CO2/Venting)", "value": "F3", "color": "#8E44AD", "icon": "💨"},
+    {"label": "IQ (Internal Quality)", "value": "F11", "color": "#D35400", "icon": "🔍"},
+    {"label": "EQ (External Quality)", "value": "E31-EQ", "color": "#C0392B", "icon": "✓"},
+    {"label": "Remote Hold", "value": "E2", "color": "#34495E", "icon": "⏸️"},
+    {"label": "PDL/Diagnostic Tires", "value": "D1", "color": "#1ABC9C", "icon": "🔬"},
+    {"label": "TSM (Mech. Troubleshooting)", "value": "F13A", "color": "#E74C3C", "icon": "🔨"},
+    {"label": "TSE (Elec. Troubleshooting)", "value": "F13B", "color": "#3498DB", "icon": "⚡"},
+    {"label": "LT (Long Term Maint.)", "value": "F1", "color": "#9B59B6", "icon": "🛠️"},
+    {"label": "CA (Calibration)", "value": "D2", "color": "#F39C12", "icon": "📏"},
+    {"label": "PM (Preventative Maint.)", "value": "D22", "color": "#27AE60", "icon": "🔧"},
+    {"label": "CL (Machine Cleaning)", "value": "D3", "color": "#16A085", "icon": "🧹"},
+    {"label": "MC (Mold Change)", "value": "F2-MC", "color": "#E67E22", "icon": "🔄"},
+    {"label": "MT (Mold Troubleshooting)", "value": "F12", "color": "#8E44AD", "icon": "🔍"},
+    {"label": "RH (RE-Heat)", "value": "F4", "color": "#2C3E50", "icon": "🌡️"},
+    {"label": "WP (Wet Paint)", "value": "F14", "color": "#FF6B6B", "icon": "🎨"},
+    {"label": "CN (Conveyors)", "value": "F15", "color": "#4ECDC4", "icon": "🔗"}
+]
+
+# Quick Allocation Templates
+QUICK_ALLOCATION_TEMPLATES = {
+    "maintenance": {
+        "name": "Standard Maintenance",
+        "allocations": {"F1": 0.5, "F13A": 0.3, "F13B": 0.2},
+        "icon": "🔧"
+    },
+    "quality_issue": {
+        "name": "Quality Issue",
+        "allocations": {"F11": 0.6, "E31-EQ": 0.4},
+        "icon": "✓"
+    },
+    "changeover": {
+        "name": "Mold Changeover",
+        "allocations": {"F2-MC": 0.8, "F2": 0.2},
+        "icon": "🔄"
+    },
+    "troubleshooting": {
+        "name": "Troubleshooting",
+        "allocations": {"F13A": 0.4, "F13B": 0.4, "F12": 0.2},
+        "icon": "🔍"
+    }
+}
+
+# Hidden columns
+STATIC_HIDE_COLS = {
+    "Categories", "Comment", "Duration_Display", "Remaining_Duration", 
+    "Original_Duration", "Reasons", "Orig_dur", "shift_status", 
+    "Calculated_Duration", "_parsed_start", "_parsed_end", "parsed_start",
+    "_deleted", "parsed_end", "Composite_key", "Category_Durations"
+}
+
+# Duration filter options
+DURATION_OPTIONS = [
+    {"label": "All Durations", "value": 0},
+    {"label": "> 5 minutes", "value": 5},
+    {"label": "> 10 minutes", "value": 10},
+    {"label": "> 30 minutes", "value": 30},
+    {"label": "> 60 minutes", "value": 60}
+]
+
+# Event status filter options
+EVENT_STATUS_OPTIONS = [
+    {"label": "All Events", "value": "all"},
+    {"label": "Ongoing Only", "value": "ongoing"},
+    {"label": "Ended Only", "value": "ended"},
+    {"label": "Allocated", "value": "allocated"},
+    {"label": "Unallocated", "value": "unallocated"}
+]
+
+# Button styles
+BUTTON_STYLES = {
+    "primary": {
+        "backgroundColor": "#3498db",
+        "color": "white",
+        "border": "none",
+        "padding": "8px 16px",
+        "borderRadius": "4px",
+        "cursor": "pointer",
+        "fontSize": "13px",
+        "fontWeight": "500",
+        "transition": "all 0.2s ease"
+    },
+    "secondary": {
+        "backgroundColor": "#95a5a6",
+        "color": "white",
+        "border": "none",
+        "padding": "8px 16px",
+        "borderRadius": "4px",
+        "cursor": "pointer",
+        "fontSize": "13px",
+        "fontWeight": "500",
+        "transition": "all 0.2s ease"
+    },
+    "success": {
+        "backgroundColor": "#27ae60",
+        "color": "white",
+        "border": "none",
+        "padding": "8px 16px",
+        "borderRadius": "4px",
+        "cursor": "pointer",
+        "fontSize": "13px",
+        "fontWeight": "500",
+        "transition": "all 0.2s ease"
+    },
+    "info": {
+        "backgroundColor": "#16a085",
+        "color": "white",
+        "border": "none",
+        "padding": "8px 16px",
+        "borderRadius": "4px",
+        "cursor": "pointer",
+        "fontSize": "13px",
+        "fontWeight": "500",
+        "transition": "all 0.2s ease"
+    },
+    "warning": {
+        "backgroundColor": "#e74c3c",
+        "color": "white",
+        "border": "none",
+        "padding": "8px 16px",
+        "borderRadius": "4px",
+        "cursor": "pointer",
+        "fontSize": "13px",
+        "fontWeight": "500",
+        "transition": "all 0.2s ease"
+    },
+    "template": {
+        "backgroundColor": "#ecf0f1",
+        "color": "#2c3e50",
+        "border": "1px solid #bdc3c7",
+        "padding": "6px 12px",
+        "borderRadius": "4px",
+        "cursor": "pointer",
+        "fontSize": "13px",
+        "transition": "all 0.2s ease"
+    }
+}
+
+# Enhanced History Manager
+class HistoryManager:
+    def __init__(self, max_size=50):
+        self.history = deque(maxlen=max_size)
+        self.future = deque()
+        self.current_index = -1
+        
+    def save_state(self, state, description=""):
+        """Save state with descriptive action"""
+        self.history.append({
+            'state': state.copy(),
+            'timestamp': datetime.datetime.now(),
+            'description': description
+        })
+        self.future.clear()
+        self.current_index = len(self.history) - 1
+        
+    def undo(self):
+        """Undo last action"""
+        if self.current_index > 0:
+            self.future.append(self.history[self.current_index])
+            self.current_index -= 1
+            return self.history[self.current_index]['state']
+        return None
+    
+    def redo(self):
+        """Redo last undone action"""
+        if self.future:
+            state = self.future.pop()
+            self.current_index += 1
+            return state['state']
+        return None
+    
+    def get_history_summary(self):
+        """Get summary of recent changes"""
+        return [
+            f"{h['timestamp'].strftime('%H:%M:%S')} - {h['description']}"
+            for h in list(self.history)[-10:]
+        ]
+
+# Enhanced Data Manager
+class CategoryDurationDataManager:
+    def __init__(self):
+        self.full_df = None
+        self.view_df = None
+        self.original_df = None
+        
+        # Caching
+        self.press_options_cache = {}
+        self.stats_cache = {}
+        self.allocation_cache = {}
+        
+        # State management
+        self.data_version = 0
+        
+        # Auto-operation tracking
+        self.last_auto_save = datetime.datetime.now()
+        self.pending_changes = False
+        
+        # History management
+        self.history_manager = HistoryManager()
+        
+        # Error tracking
+        self.last_errors = []
+        
+    def user_friendly_error(self, error_type, details=None):
+        """Convert technical errors to user-friendly messages"""
+        error_map = {
+            "parse_timestamp": "Invalid date format. Please use YYYY-MM-DD HH:MM format.",
+            "allocation_exceeded": f"Cannot allocate {details.get('requested', 'N/A')} minutes. Only {details.get('available', 'N/A')} minutes remaining.",
+            "save_failed": "Unable to save changes. Please try again or contact support.",
+            "load_failed": "Unable to load data. Please check your connection.",
+            "validation_failed": "Data validation failed. Please check your entries."
+        }
+        return error_map.get(error_type, f"An error occurred: {error_type}")
+    
+    def load_data(self):
+        """Load data with improved error handling"""
+        try:
+            print("Loading data...")
+            print(f"Current time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            
+            # Load fresh data
+            self.full_df = dataiku.Dataset(CONFIG["datasets"]["original"]).get_dataframe()
+            print(f"✓ Loaded {len(self.full_df)} records")
+            
+            # Convert match column to string
+            self.full_df[CONFIG["columns"]["match"]] = self.full_df[CONFIG["columns"]["match"]].astype(str)
+            
+            # Initialize columns
+            for col in ["Categories", "Comment", "Category_Durations"]:
+                if col not in self.full_df.columns:
+                    self.full_df[col] = ""
+                    
+            if "Duration" not in self.full_df.columns:
+                self.full_df["Duration"] = 0
+            else:
+                self.full_df["Duration"] = pd.to_numeric(self.full_df["Duration"], errors="coerce").fillna(0)
+            
+            # Parse timestamps
+            self.full_df['parsed_start'] = self.full_df[CONFIG["columns"]["timestamp"]].apply(self.parse_timestamp)
+            self.full_df['parsed_end'] = self.full_df[CONFIG["columns"]["end_timestamp"]].apply(self.parse_timestamp_end)
+            
+            # Calculate durations using vectorized operations
+            self._update_all_durations_vectorized()
+            
+            # Load annotations from managed dataset
+            self._merge_annotations()
+            
+            # Store original copy
+            self.original_df = self.full_df.copy()
+            
+            # Cache press options
+            self._cache_press_options()
+            
+            # Save initial state
+            self.history_manager.save_state(self.full_df, "Initial load")
+            
+            # Clear caches
+            self.allocation_cache.clear()
+            
+            self.data_version += 1
+            
+            return True
+            
+        except Exception as e:
+            self.last_errors.append(self.user_friendly_error("load_failed", {"error": str(e)}))
+            print(f"❌ Error loading data: {e}")
+            traceback.print_exc()
+            return False
+    
+    def _update_all_durations_vectorized(self):
+        """Vectorized duration update for better performance"""
+        # For ongoing events
+        mask_ongoing = self.full_df['parsed_end'] == pd.Timestamp.max
+        current_time = pd.Timestamp.now()
+        
+        # For ended events
+        mask_ended = ~mask_ongoing & self.full_df['parsed_start'].notna() & self.full_df['parsed_end'].notna()
+        
+        # Calculate durations
+        self.full_df.loc[mask_ongoing, 'Calculated_Duration'] = (
+            (current_time - self.full_df.loc[mask_ongoing, 'parsed_start']).dt.total_seconds() / 60
+        )
+        
+        self.full_df.loc[mask_ended, 'Calculated_Duration'] = (
+            (self.full_df.loc[mask_ended, 'parsed_end'] - 
+             self.full_df.loc[mask_ended, 'parsed_start']).dt.total_seconds() / 60
+        )
+        
+        # Set 0 for invalid durations
+        self.full_df.loc[self.full_df['Calculated_Duration'] < 0, 'Calculated_Duration'] = 0
+    
+    def _merge_annotations(self):
+        """Merge annotations from managed dataset"""
+        try:
+            managed_df = dataiku.Dataset(CONFIG["datasets"]["managed"]).get_dataframe()
+            if not managed_df.empty:
+                managed_df[CONFIG["columns"]["match"]] = managed_df[CONFIG["columns"]["match"]].astype(str)
+                
+                # Use merge for better performance
+                merge_cols = [CONFIG["columns"]["match"], "Categories", "Comment", "Category_Durations"]
+                merge_df = managed_df[merge_cols].drop_duplicates(subset=[CONFIG["columns"]["match"]])
+                
+                self.full_df = self.full_df.merge(
+                    merge_df,
+                    on=CONFIG["columns"]["match"],
+                    how='left',
+                    suffixes=('', '_managed')
+                )
+                
+                # Update with managed values where they exist
+                for col in ["Categories", "Comment", "Category_Durations"]:
+                    mask = self.full_df[f"{col}_managed"].notna()
+                    self.full_df.loc[mask, col] = self.full_df.loc[mask, f"{col}_managed"]
+                    self.full_df.drop(f"{col}_managed", axis=1, inplace=True)
+                
+                print(f"✓ Merged annotations from managed dataset")
+                
+        except Exception as e:
+            print(f"ℹ No existing annotations found: {e}")
+    
+    def parse_timestamp(self, ts_str):
+        """Parse timestamp with better error handling"""
+        if pd.isna(ts_str) or ts_str is None:
+            return pd.NaT
+        
+        ts_str = str(ts_str).strip()
+        
+        # Remove :00 suffix if present
+        if ts_str.endswith(':00'):
+            ts_str = ts_str[:-3]
+        
+        try:
+            return pd.to_datetime(ts_str)
+        except Exception:
+            # Try alternative formats
+            for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%m/%d/%Y %H:%M']:
+                try:
+                    return pd.to_datetime(ts_str, format=fmt)
+                except:
+                    continue
+            return pd.NaT
+    
+    def parse_timestamp_end(self, ts_str):
+        """Parse end timestamp"""
+        if pd.isna(ts_str) or ts_str is None:
+            return pd.NaT
+        if CONFIG["columns"]["null_timestamp"] in str(ts_str):
+            return pd.Timestamp.max
+        return self.parse_timestamp(ts_str)
+    
+    def parse_category_durations(self, cat_dur_str):
+        """Parse category duration with JSON support"""
+        if not cat_dur_str or pd.isna(cat_dur_str):
+            return {}
+        
+        # Check cache first
+        cache_key = str(cat_dur_str)
+        if cache_key in self.allocation_cache:
+            return self.allocation_cache[cache_key].copy()
+        
+        result = {}
+        try:
+            # Try JSON format first
+            result = json.loads(cat_dur_str)
+        except:
+            # Fall back to legacy format
+            try:
+                pairs = str(cat_dur_str).split(",")
+                for pair in pairs:
+                    if ":" in pair:
+                        cat, dur = pair.split(":", 1)
+                        result[cat.strip()] = float(dur.strip())
+            except Exception as e:
+                print(f"Error parsing category durations: {cat_dur_str}, error: {e}")
+        
+        # Cache result
+        self.allocation_cache[cache_key] = result.copy()
+        return result
+    
+    def format_category_durations(self, cat_dur_dict):
+        """Format category duration as JSON"""
+        if not cat_dur_dict:
+            return ""
+        
+        # Use JSON format for better reliability
+        try:
+            return json.dumps(cat_dur_dict)
+        except:
+            # Fallback to legacy format
+            pairs = [f"{cat}:{dur}" for cat, dur in cat_dur_dict.items()]
+            return ",".join(pairs)
+    
+    @lru_cache(maxsize=128)
+    def calculate_allocation_stats(self, event_key):
+        """Cached allocation calculations"""
+        event_data = self.full_df[self.full_df[CONFIG["columns"]["match"]] == event_key]
+        if event_data.empty:
+            return None
+            
+        row = event_data.iloc[0]
+        total_duration = row.get('Calculated_Duration', 0)
+        cat_durations = self.parse_category_durations(row.get('Category_Durations', ''))
+        allocated_duration = sum(cat_durations.values())
+        
+        return {
+            'total_duration': total_duration,
+            'allocated_duration': allocated_duration,
+            'remaining_duration': total_duration - allocated_duration,
+            'allocation_percentage': (allocated_duration / total_duration * 100) if total_duration > 0 else 0,
+            'category_count': len(cat_durations)
+        }
+    
+    def _cache_press_options(self):
+        """Cache press options for all filters"""
+        if self.full_df is None:
+            return
+        
+        all_presses = sorted(self.full_df["Press_ID"].dropna().unique())
+        
+        # Define press groups
+        press_groups = {
+            "ALL": lambda x: True,
+            "C&D": lambda x: x[0].upper() in ['C', 'D'],
+            "E,F&G": lambda x: x[0].upper() in ['E', 'F', 'G'],
+            "J&K": lambda x: x[0].upper() in ['J', 'K'],
+            "L&M": lambda x: x[0].upper() in ['L', 'M'],
+            "N&P": lambda x: x[0].upper() in ['N', 'P']
+        }
+        
+        for group_name, filter_func in press_groups.items():
+            filtered = [p for p in all_presses if filter_func(str(p))]
+            self.press_options_cache[group_name] = [
+                {"label": str(p), "value": str(p)} for p in filtered
+            ]
+    
+    def get_press_options(self, row_filter):
+        """Get cached press options"""
+        return self.press_options_cache.get(row_filter, [])
+    
+    def get_filtered_data(self, start_date, end_date, press_row, press_ids, 
+                         duration_threshold, event_status="all", selected_events=None):
+        """Get filtered data with improved filtering logic"""
+        if self.full_df is None:
+            return pd.DataFrame()
+        
+        df = self.full_df.copy()
+        
+        # Apply selection filter if bulk mode
+        if selected_events:
+            df = df[df[CONFIG["columns"]["match"]].isin(selected_events)]
+        
+        # Date filter with better carryover logic
+        if start_date and end_date:
+            start_dt = pd.to_datetime(start_date)
+            end_dt = pd.to_datetime(end_date)
+            
+            # Include events that overlap with the period
+            mask = (
+                ((df['parsed_start'] >= start_dt) & (df['parsed_start'] <= end_dt)) |
+                ((df['parsed_start'] < start_dt) & 
+                 ((df['parsed_end'] > start_dt) | (df['parsed_end'] == pd.Timestamp.max)))
+            )
+            
+            df = df[mask]
+            
+            # Mark carryover events
+            df['shift_status'] = df.apply(
+                lambda row: 'carryover' if row['parsed_start'] < start_dt else 'current',
+                axis=1
+            )
+        else:
+            df['shift_status'] = 'current'
+        
+        # Update durations for ongoing events
+        self._update_view_durations(df)
+        
+        # Event status filter
+        if event_status == "ongoing":
+            df = df[df['parsed_end'] == pd.Timestamp.max]
+        elif event_status == "ended":
+            df = df[df['parsed_end'] != pd.Timestamp.max]
+        elif event_status == "allocated":
+            df['has_allocation'] = df['Category_Durations'].apply(
+                lambda x: bool(x) and str(x).strip() not in ['', '{}']
+            )
+            df = df[df['has_allocation']]
+        elif event_status == "unallocated":
+            df['has_allocation'] = df['Category_Durations'].apply(
+                lambda x: not bool(x) or str(x).strip() in ['', '{}']
+            )
+            df = df[df['has_allocation']]
+        
+        # Press filters
+        if press_row and press_row != "ALL":
+            press_filter = self.press_options_cache.get(press_row, [])
+            valid_presses = [p['value'] for p in press_filter]
+            df = df[df["Press_ID"].astype(str).isin(valid_presses)]
+        
+        if press_ids:
+            df = df[df["Press_ID"].astype(str).isin(press_ids)]
+        
+        # Duration filter
+        if duration_threshold:
+            df = df[df['Calculated_Duration'] > duration_threshold]
+        
+        # Calculate allocation metrics
+        for idx, row in df.iterrows():
+            stats = self.calculate_allocation_stats(row[CONFIG["columns"]["match"]])
+            if stats:
+                df.at[idx, 'Allocated_Duration'] = stats['allocated_duration']
+                df.at[idx, 'Remaining_Duration'] = stats['remaining_duration']
+                df.at[idx, 'Allocation_Percentage'] = stats['allocation_percentage']
+        
+        self.view_df = df.sort_values(by=[CONFIG["columns"]["timestamp"]], ascending=False)
+        return self.view_df
+    
+    def _update_view_durations(self, df):
+        """Update durations for the view dataframe"""
+        mask_ongoing = df['parsed_end'] == pd.Timestamp.max
+        current_time = pd.Timestamp.now()
+        
+        df.loc[mask_ongoing, 'Calculated_Duration'] = df.loc[mask_ongoing].apply(
+            lambda row: (current_time - row['parsed_start']).total_seconds() / 60,
+            axis=1
+        )
+    
+    def validate_event_data(self, event_key):
+        """Comprehensive validation before save"""
+        errors = []
+        warnings = []
+        
+        event_data = self.full_df[self.full_df[CONFIG["columns"]["match"]] == event_key]
+        if event_data.empty:
+            errors.append("Event not found")
+            return errors, warnings
+            
+        row = event_data.iloc[0]
+        
+        # Time validation
+        if row['parsed_end'] != pd.Timestamp.max and row['parsed_end'] < row['parsed_start']:
+            errors.append("End time is before start time")
+        
+        # Allocation validation
+        total_duration = row.get('Calculated_Duration', 0)
+        cat_durations = self.parse_category_durations(row.get('Category_Durations', ''))
+        allocated_duration = sum(cat_durations.values())
+        
+        if allocated_duration > total_duration * CONFIG["validation"]["over_allocation_tolerance"]:
+            errors.append(f"Over-allocated by more than {(CONFIG['validation']['over_allocation_tolerance'] - 1) * 100}%")
+        
+        # Check for duplicate categories
+        if len(cat_durations) != len(set(cat_durations.keys())):
+            warnings.append("Duplicate category allocations detected")
+        
+        return errors, warnings
+    
+    def update_data(self, key, field, value, description=""):
+        """Update data with history tracking"""
+        self.history_manager.save_state(self.full_df, description or f"Updated {field}")
+        
+        mask = self.full_df[CONFIG["columns"]["match"]] == key
+        if mask.any():
+            self.full_df.loc[mask, field] = value
+            self.data_version += 1
+            self.pending_changes = True
+            # Clear allocation cache for this event
+            self.calculate_allocation_stats.cache_clear()
+            return True
+        return False
+    
+    def update_category_durations(self, key, cat_dur_dict, description=""):
+        """Update category durations with validation"""
+        # Validate first
+        errors, warnings = self.validate_event_data(key)
+        if errors:
+            raise ValueError(f"Validation failed: {', '.join(errors)}")
+        
+        cat_dur_str = self.format_category_durations(cat_dur_dict)
+        categories_str = ",".join(cat_dur_dict.keys())
+        
+        self.history_manager.save_state(self.full_df, description or f"Updated allocations for {key}")
+        
+        mask = self.full_df[CONFIG["columns"]["match"]] == key
+        if mask.any():
+            self.full_df.loc[mask, 'Category_Durations'] = cat_dur_str
+            self.full_df.loc[mask, 'Categories'] = categories_str
+            self.data_version += 1
+            self.pending_changes = True
+            # Clear cache
+            self.calculate_allocation_stats.cache_clear()
+            return True
+        return False
+    
+    def bulk_update_category_durations(self, event_keys, template_name):
+        """Apply template to multiple events"""
+        if template_name not in QUICK_ALLOCATION_TEMPLATES:
+            return False, "Template not found"
+        
+        template = QUICK_ALLOCATION_TEMPLATES[template_name]
+        success_count = 0
+        errors = []
+        
+        self.history_manager.save_state(self.full_df, f"Bulk apply template: {template['name']}")
+        
+        for event_key in event_keys:
+            try:
+                event_data = self.full_df[self.full_df[CONFIG["columns"]["match"]] == event_key]
+                if event_data.empty:
+                    continue
+                    
+                total_duration = event_data.iloc[0]['Calculated_Duration']
+                allocations = {
+                    cat: total_duration * percentage 
+                    for cat, percentage in template['allocations'].items()
+                }
+                
+                if self.update_category_durations(event_key, allocations, f"Applied template {template_name}"):
+                    success_count += 1
+                    
+            except Exception as e:
+                errors.append(f"{event_key}: {str(e)}")
+        
+        return success_count, errors
+    
+    def safe_save_with_rollback(self):
+        """Save with automatic rollback on failure"""
+        backup_df = self.full_df.copy()
+        try:
+            # Remove internal columns before saving
+            save_df = self.full_df.copy()
+            internal_cols = ['parsed_start', 'parsed_end', 'shift_status', 
+                           'Duration_Display', 'Remaining_Duration', 'Allocated_Duration', 
+                           'has_allocation', 'Calculated_Duration', 'Allocation_Percentage']
+            save_cols = [col for col in save_df.columns if col not in internal_cols]
+            save_df = save_df[save_cols]
+            
+            dataset = dataiku.Dataset(CONFIG["datasets"]["managed"])
+            dataset.write_with_schema(save_df)
+            
+            self.pending_changes = False
+            self.last_auto_save = datetime.datetime.now()
+            
+            print(f"✓ Saved {len(save_df)} records successfully")
+            return True
+            
+        except Exception as e:
+            # Rollback on failure
+            self.full_df = backup_df
+            self.last_errors.append(self.user_friendly_error("save_failed", {"error": str(e)}))
+            print(f"❌ Save failed, data rolled back: {e}")
+            return False
+    
+    def get_stats(self):
+        """Get category statistics with caching"""
+        if self.view_df is None or self.view_df.empty:
+            return {}
+        
+        # Create cache key from view data
+        cache_key = f"{len(self.view_df)}_{self.data_version}"
+        if cache_key in self.stats_cache:
+            return self.stats_cache[cache_key]
+        
+        category_time = defaultdict(float)
+        category_count = defaultdict(int)
+        
+        for _, row in self.view_df.iterrows():
+            cat_durations = self.parse_category_durations(row.get('Category_Durations', ''))
+            
+            for cat, dur in cat_durations.items():
+                category_time[cat] += dur
+                category_count[cat] += 1
+        
+        stats = {}
+        for cat_code in category_time:
+            cat_info = next((c for c in EVENT_CATEGORIES if c["value"] == cat_code), None)
+            if cat_info:
+                stats[cat_info["label"]] = {
+                    'count': category_count[cat_code],
+                    'total_time': category_time[cat_code],
+                    'avg_time': category_time[cat_code] / category_count[cat_code] if category_count[cat_code] > 0 else 0,
+                    'color': cat_info['color'],
+                    'icon': cat_info.get('icon', '')
+                }
+        
+        # Cache results
+        self.stats_cache[cache_key] = stats
+        return stats
+    
+    def validate_durations(self):
+        """Smart validation with configurable thresholds"""
+        if self.view_df is None:
+            return []
+        
+        errors = []
+        warnings = []
+        
+        for idx, row in self.view_df.iterrows():
+            event_id = row[CONFIG["columns"]["match"]]
+            total_duration = row.get('Calculated_Duration', 0)
+            cat_durations = self.parse_category_durations(row.get('Category_Durations', ''))
+            
+            allocated_duration = sum(cat_durations.values())
+            
+            # Skip warnings for short events
+            if total_duration < CONFIG["validation"]["min_event_duration_for_warning"] and allocated_duration == 0:
+                continue
+            
+            if allocated_duration > total_duration * CONFIG["validation"]["over_allocation_tolerance"]:
+                errors.append(
+                    f"❌ {event_id}: Over-allocated by {((allocated_duration/total_duration - 1) * 100):.0f}%"
+                )
+            elif total_duration >= CONFIG["validation"]["min_event_duration_for_warning"] and \
+                 allocated_duration < total_duration * CONFIG["validation"]["allocation_warning_threshold"]:
+                unallocated = total_duration - allocated_duration
+                warnings.append(
+                    f"⚠️ {event_id}: {format_minutes(unallocated)} unallocated "
+                    f"({(allocated_duration/total_duration*100):.0f}% allocated)"
+                )
+        
+        return errors + warnings
+    
+    def get_allocation_summary(self):
+        """Get enhanced allocation summary"""
+        if self.view_df is None or self.view_df.empty:
+            return {}
+        
+        total_events = len(self.view_df)
+        fully_allocated = 0
+        partially_allocated = 0
+        unallocated = 0
+        total_time = 0
+        total_allocated_time = 0
+        
+        for _, row in self.view_df.iterrows():
+            total_duration = row.get('Calculated_Duration', 0)
+            allocation_pct = row.get('Allocation_Percentage', 0)
+            allocated_duration = row.get('Allocated_Duration', 0)
+            
+            total_time += total_duration
+            total_allocated_time += allocated_duration
+            
+            if allocation_pct >= 100:
+                fully_allocated += 1
+            elif allocation_pct > 0:
+                partially_allocated += 1
+            else:
+                unallocated += 1
+        
+        return {
+            'total_events': total_events,
+            'fully_allocated': fully_allocated,
+            'partially_allocated': partially_allocated,
+            'unallocated': unallocated,
+            'total_time': total_time,
+            'total_allocated_time': total_allocated_time,
+            'overall_allocation_percentage': (total_allocated_time / total_time * 100) if total_time > 0 else 0
+        }
+    
+    def calculate_data_quality_score(self):
+        """Calculate overall data quality score"""
+        if self.view_df is None or self.view_df.empty:
+            return {'overall_score': 0, 'details': {}}
+        
+        df = self.view_df
+        total_events = len(df)
+        
+        metrics = {
+            'completeness': len(df[df['Categories'] != '']) / total_events if total_events > 0 else 0,
+            'allocation_accuracy': len(df[df.get('Allocation_Percentage', 0) <= 110]) / total_events if total_events > 0 else 0,
+            'comment_coverage': len(df[df['Comment'] != '']) / total_events if total_events > 0 else 0,
+            'time_consistency': len(df[df['parsed_end'] >= df['parsed_start']]) / total_events if total_events > 0 else 0
+        }
+        
+        overall_score = sum(metrics.values()) / len(metrics) * 100
+        
+        return {
+            'overall_score': overall_score,
+            'details': {k: v * 100 for k, v in metrics.items()}
+        }
+    
+    def get_event_data(self, event_key):
+        """Get specific event data for modal"""
+        mask = self.full_df[CONFIG["columns"]["match"]] == event_key
+        if mask.any():
+            row = self.full_df[mask].iloc[0]
+            return {
+                'key': event_key,
+                'total_duration': row.get('Calculated_Duration', 0),
+                'category_durations': self.parse_category_durations(row.get('Category_Durations', '')),
+                'comment': row.get('Comment', ''),
+                'press_id': row.get('Press_ID', ''),
+                'start_time': row.get('parsed_start', ''),
+                'end_time': row.get('parsed_end', ''),
+                'is_ongoing': row.get('parsed_end') == pd.Timestamp.max
+            }
+        return None
+    
+    def undo(self):
+        """Undo last action"""
+        state = self.history_manager.undo()
+        if state is not None:
+            self.full_df = state.copy()
+            self.data_version += 1
+            self.pending_changes = True
+            # Clear caches
+            self.calculate_allocation_stats.cache_clear()
+            self.stats_cache.clear()
+            return True
+        return False
+    
+    def redo(self):
+        """Redo last undone action"""
+        state = self.history_manager.redo()
+        if state is not None:
+            self.full_df = state.copy()
+            self.data_version += 1
+            self.pending_changes = True
+            # Clear caches
+            self.calculate_allocation_stats.cache_clear()
+            self.stats_cache.clear()
+            return True
+        return False
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+def get_current_shift_range():
+    """Get the current shift range"""
+    now = datetime.datetime.now()
+    hour = now.hour
+    
+    for shift_name, shift_config in CONFIG["shifts"].items():
+        if shift_config["start"] <= shift_config["end"]:
+            if shift_config["start"] <= hour < shift_config["end"]:
+                start = datetime.datetime.combine(now.date(), time(shift_config["start"], 0))
+                end = datetime.datetime.combine(now.date(), time(shift_config["end"], 0))
+                return start, end, shift_name
+        else:
+            if hour >= shift_config["start"] or hour < shift_config["end"]:
+                if hour >= shift_config["start"]:
+                    start = datetime.datetime.combine(now.date(), time(shift_config["start"], 0))
+                    end = datetime.datetime.combine(now.date() + timedelta(days=1), time(shift_config["end"], 0))
+                else:
+                    start = datetime.datetime.combine(now.date() - timedelta(days=1), time(shift_config["start"], 0))
+                    end = datetime.datetime.combine(now.date(), time(shift_config["end"], 0))
+                return start, end, shift_name
+    
+    return None, None, None
+
+def get_shift_from_datetime(dt):
+    """Determine which shift a datetime belongs to"""
+    hour = dt.hour
+    
+    for shift_name, shift_config in CONFIG["shifts"].items():
+        if shift_config["start"] <= shift_config["end"]:
+            if shift_config["start"] <= hour < shift_config["end"]:
+                start = datetime.datetime.combine(dt.date(), time(shift_config["start"], 0))
+                end = datetime.datetime.combine(dt.date(), time(shift_config["end"], 0))
+                return start, end, shift_name
+        else:
+            if hour >= shift_config["start"] or hour < shift_config["end"]:
+                if hour >= shift_config["start"]:
+                    start = datetime.datetime.combine(dt.date(), time(shift_config["start"], 0))
+                    end = datetime.datetime.combine(dt.date() + timedelta(days=1), time(shift_config["end"], 0))
+                else:
+                    start = datetime.datetime.combine(dt.date() - timedelta(days=1), time(shift_config["start"], 0))
+                    end = datetime.datetime.combine(dt.date(), time(shift_config["end"], 0))
+                return start, end, shift_name
+    
+    return None, None, None
+
+def get_previous_shift(current_start):
+    """Get the previous shift"""
+    prev_start = current_start - timedelta(hours=12)
+    return get_shift_from_datetime(prev_start)
+
+def get_next_shift(current_start):
+    """Get the next shift"""
+    next_start = current_start + timedelta(hours=12)
+    return get_shift_from_datetime(next_start)
+
+def format_minutes(mins):
+    """Format minutes into human-readable format"""
+    try:
+        m = float(mins)
+        if m < 60:
+            return f"{int(m)}m"
+        elif m < 1440:
+            h = int(m // 60)
+            remaining = int(m % 60)
+            if remaining > 0:
+                return f"{h}h {remaining}m"
+            return f"{h}h"
+        else:
+            days = int(m // 1440)
+            remaining_mins = m % 1440
+            hours = int(remaining_mins // 60)
+            if hours > 0:
+                return f"{days}d {hours}h"
+            return f"{days}d"
+    except:
+        return str(mins)
+
+# =============================================================================
+# Build Table Function
+# =============================================================================
+def build_table(df, bulk_mode=False):
+    """Build enhanced HTML table with improved UI"""
+    if df.empty:
+        return html.Div([
+            html.Div("📊", style={"fontSize": "48px", "opacity": "0.3"}),
+            html.Div("No data found with current filters", 
+                    style={"fontSize": "16px", "color": "#7f8c8d", "marginTop": "10px"}),
+            html.Div("Try adjusting your filters or date range", 
+                    style={"fontSize": "14px", "color": "#95a5a6", "marginTop": "5px"})
+        ], style={"textAlign": "center", "padding": "60px", "backgroundColor": "#f8f9fa", "borderRadius": "8px"})
+    
+    # Column configuration
+    COLUMN_ORDER = ["Press_ID", "StartTime EST", "EndTime EST", "Duration"]
+    COLUMN_WIDTHS = {
+        "Selection": "3%",
+        "Press_ID": "6%",
+        "StartTime EST": "12%",
+        "EndTime EST": "12%",
+        "Duration": "8%",
+        "Composite_key": "12%",
+        "Category Allocations": "22%",
+        "Comment": "25%"
+    }
+    
+    # Create header
+    header_cells = []
+    
+    # Add selection column if in bulk mode
+    if bulk_mode:
+        header_cells.append(html.Th(
+            dcc.Checklist(
+                id="select-all-events",
+                options=[{"label": "", "value": "all"}],
+                value=[],
+                style={"margin": "0"}
+            ),
+            style={
+                "width": COLUMN_WIDTHS["Selection"],
+                "textAlign": "center",
+                "padding": "8px",
+                "backgroundColor": "#34495e",
+                "color": "white",
+                "position": "sticky",
+                "top": "0",
+                "zIndex": "100"
+            }
+        ))
+    
+    # Add data columns
+    for col in COLUMN_ORDER:
+        if col in df.columns:
+            display_name = {
+                "StartTime EST": "Start Time",
+                "EndTime EST": "End Time",
+                "Duration": "Total Duration"
+            }.get(col, col)
+            
+            header_cells.append(html.Th(display_name, style={
+                "width": COLUMN_WIDTHS.get(col, "auto"),
+                "textAlign": "center",
+                "padding": "12px 8px",
+                "backgroundColor": "#34495e",
+                "color": "white",
+                "fontWeight": "500",
+                "fontSize": "14px",
+                "position": "sticky",
+                "top": "0",
+                "zIndex": "100",
+                "borderRight": "1px solid #2c3e50"
+            }))
+    
+    # Add Composite Key if not hidden
+    if CONFIG["columns"]["match"] in df.columns and CONFIG["columns"]["match"] not in STATIC_HIDE_COLS:
+        header_cells.append(html.Th("Event ID", style={
+            "width": COLUMN_WIDTHS["Composite_key"],
+            "textAlign": "center",
+            "padding": "12px 8px",
+            "backgroundColor": "#34495e",
+            "color": "white",
+            "fontWeight": "500",
+            "fontSize": "14px",
+            "position": "sticky",
+            "top": "0",
+            "zIndex": "100",
+            "borderRight": "1px solid #2c3e50"
+        }))
+    
+    # Add annotation columns
+    for col_name in ["Category Allocations", "Comment"]:
+        header_cells.append(html.Th(col_name, style={
+            "width": COLUMN_WIDTHS[col_name],
+            "textAlign": "center",
+            "padding": "12px 8px",
+            "backgroundColor": "#34495e",
+            "color": "white",
+            "fontWeight": "500",
+            "fontSize": "14px",
+            "position": "sticky",
+            "top": "0",
+            "zIndex": "100",
+            "borderRight": "1px solid #2c3e50" if col_name != "Comment" else "none"
+        }))
+    
+    header_row = html.Tr(header_cells)
+    
+    # Create table rows
+    table_rows = []
+    for idx, row in df.iterrows():
+        # Determine row styling
+        if hasattr(row, 'shift_status') and row.shift_status == 'carryover':
+            row_bg = "#fff3cd"
+        else:
+            row_bg = "#ffffff" if len(table_rows) % 2 == 0 else "#f8f9fa"
+        
+        row_cells = []
+        
+        # Selection checkbox if in bulk mode
+        if bulk_mode:
+            row_cells.append(html.Td(
+                dcc.Checklist(
+                    id={"type": "event-select", "index": row[CONFIG["columns"]["match"]]},
+                    options=[{"label": "", "value": row[CONFIG["columns"]["match"]]}],
+                    value=[],
+                    style={"margin": "0"}
+                ),
+                style={
+                    "width": COLUMN_WIDTHS["Selection"],
+                    "textAlign": "center",
+                    "padding": "4px",
+                    "borderRight": "1px solid #ecf0f1"
+                }
+            ))
+        
+        # Data columns
+        for col in COLUMN_ORDER:
+            if col in df.columns:
+                cell_style = {
+                    "textAlign": "center",
+                    "padding": "8px",
+                    "fontSize": "13px",
+                    "borderRight": "1px solid #ecf0f1",
+                    "width": COLUMN_WIDTHS.get(col, "auto")
+                }
+                
+                val = row[col]
+                
+                if col == "Duration":
+                    # Enhanced duration display
+                    total_dur = row.get('Calculated_Duration', val)
+                    allocation_pct = row.get('Allocation_Percentage', 0)
+                    
+                    # Create progress indicator
+                    if allocation_pct >= 100:
+                        color = "#27ae60"
+                        icon = "✓"
+                    elif allocation_pct >= 50:
+                        color = "#f39c12"
+                        icon = "◐"
+                    else:
+                        color = "#e74c3c"
+                        icon = "○"
+                    
+                    display_content = html.Div([
+                        html.Span(format_minutes(total_dur), 
+                                 style={"fontSize": "13px", "fontWeight": "500"}),
+                        html.Span(f" {icon}", 
+                                 style={"color": color, "fontSize": "16px", "marginLeft": "4px"})
+                    ], style={"display": "flex", "alignItems": "center", "justifyContent": "center"})
+                    
+                    row_cells.append(html.Td(display_content, style=cell_style))
+                    
+                elif col == "StartTime EST":
+                    if hasattr(row['parsed_start'], 'strftime'):
+                        val = row['parsed_start'].strftime("%m/%d %H:%M")
+                    row_cells.append(html.Td(val, style=cell_style))
+                    
+                elif col == "EndTime EST":
+                    if CONFIG["columns"]["null_timestamp"] in str(val) or row.get('parsed_end') == pd.Timestamp.max:
+                        cell_style.update({
+                            "color": "#e74c3c",
+                            "fontWeight": "600",
+                            "fontStyle": "italic"
+                        })
+                        val = "Ongoing"
+                    elif hasattr(row['parsed_end'], 'strftime') and row['parsed_end'] != pd.Timestamp.max:
+                        val = row['parsed_end'].strftime("%m/%d %H:%M")
+                    row_cells.append(html.Td(val, style=cell_style))
+                    
+                elif col == "Press_ID":
+                    cell_style["fontWeight"] = "600"
+                    cell_style["color"] = "#2c3e50"
+                    row_cells.append(html.Td(str(val), style=cell_style))
+                    
+                else:
+                    row_cells.append(html.Td(str(val), style=cell_style))
+        
+        # Event ID column
+        if CONFIG["columns"]["match"] in df.columns and CONFIG["columns"]["match"] not in STATIC_HIDE_COLS:
+            event_id = row[CONFIG["columns"]["match"]]
+            if hasattr(row, 'shift_status') and row.shift_status == 'carryover':
+                event_id = f"⏰ {event_id}"
+            
+            row_cells.append(html.Td(event_id, style={
+                "textAlign": "center",
+                "padding": "8px",
+                "fontSize": "12px",
+                "fontFamily": "monospace",
+                "color": "#7f8c8d",
+                "borderRight": "1px solid #ecf0f1",
+                "width": COLUMN_WIDTHS["Composite_key"]
+            }))
+        
+        # Category Allocation Cell - Enhanced
+        allocation_pct = row.get('Allocation_Percentage', 0)
+        allocated_dur = row.get('Allocated_Duration', 0)
+        total_dur = row.get('Calculated_Duration', 0)
+        cat_count = len(data_manager.parse_category_durations(row.get('Category_Durations', '')))
+        
+        # Create allocation cell with visual progress
+        allocation_cell = html.Div([
+            # Progress bar
+            html.Div([
+                html.Div(style={
+                    "width": f"{min(allocation_pct, 100)}%",
+                    "height": "4px",
+                    "backgroundColor": "#27ae60" if allocation_pct >= 100 else "#f39c12" if allocation_pct >= 50 else "#e74c3c",
+                    "borderRadius": "2px",
+                    "transition": "width 0.3s ease"
+                })
+            ], style={
+                "width": "100%",
+                "height": "4px",
+                "backgroundColor": "#ecf0f1",
+                "borderRadius": "2px",
+                "marginBottom": "6px"
+            }),
+            # Info and button
+            html.Div([
+                html.Span(
+                    f"{cat_count} categories • {allocation_pct:.0f}% allocated",
+                    style={"fontSize": "12px", "color": "#7f8c8d"}
+                ),
+                html.Button("Edit", 
+                    id={"type": "open-modal-btn", "index": row[CONFIG["columns"]["match"]]},
+                    n_clicks=0,
+                    style={
+                        "marginLeft": "8px",
+                        "padding": "4px 12px",
+                        "fontSize": "12px",
+                        "backgroundColor": "#3498db",
+                        "color": "white",
+                        "border": "none",
+                        "borderRadius": "4px",
+                        "cursor": "pointer",
+                        "transition": "all 0.2s ease"
+                    }
+                )
+            ], style={"display": "flex", "alignItems": "center", "justifyContent": "space-between"})
+        ], style={"padding": "4px 8px"})
+        
+        row_cells.append(html.Td(allocation_cell, style={
+            "borderRight": "1px solid #ecf0f1",
+            "width": COLUMN_WIDTHS["Category Allocations"]
+        }))
+        
+        # Comment cell
+        comment_input = dcc.Input(
+            id={"type": "comment", "index": row[CONFIG["columns"]["match"]]},
+            type="text",
+            value=row.get("Comment", ""),
+            placeholder="Add comment...",
+            style={
+                "width": "100%",
+                "padding": "6px 8px",
+                "fontSize": "13px",
+                "border": "1px solid #ecf0f1",
+                "borderRadius": "4px",
+                "backgroundColor": "#ffffff",
+                "transition": "border-color 0.2s ease"
+            }
+        )
+        
+        row_cells.append(html.Td(comment_input, style={
+            "padding": "4px 8px",
+            "width": COLUMN_WIDTHS["Comment"]
+        }))
+        
+        # Create row with hover effect
+        table_rows.append(html.Tr(
+            row_cells,
+            style={
+                "backgroundColor": row_bg,
+                "borderBottom": "1px solid #ecf0f1",
+                "transition": "background-color 0.2s ease"
+            }
+        ))
+    
+    # Create table
+    table = html.Table([
+        html.Thead([header_row]),
+        html.Tbody(table_rows)
+    ], style={
+        "width": "100%",
+        "borderCollapse": "collapse",
+        "backgroundColor": "white",
+        "boxShadow": "0 1px 3px rgba(0,0,0,0.1)"
+    })
+    
+    return html.Div(table, style={
+        "overflowY": "auto",
+        "overflowX": "auto",
+        "height": CONFIG["ui"]["table_max_height"],
+        "backgroundColor": "#ffffff",
+        "borderRadius": "8px"
+    })
+
+# =============================================================================
+# Initialize
+# =============================================================================
+data_manager = CategoryDurationDataManager()
+
+# Load initial data
+print("="*60)
+print("ENHANCED ROLLING EVENTS CATEGORIZATION APP")
+print(f"Version: 2.1 (Revised)")
+print(f"Current Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+print("="*60)
+
+# Get current shift info
+current_start, current_end, current_shift = get_current_shift_range()
+
+if data_manager.load_data():
+    print(f"✓ Application initialized successfully")
+else:
+    print("✗ Failed to initialize application")
+
+# =============================================================================
+# App Layout (Revised - No html.Style)
+# =============================================================================
+app.layout = html.Div([
+    # Enhanced header section - compact 20% height
+    html.Div([
+        # Title bar
+        html.Div([
+            html.H1("Curing Downtime Events Categorization", style={
+                "margin": "0",
+                "fontSize": "24px",
+                "fontWeight": "600",
+                "color": "#2c3e50"
+            }),
+            html.Div(id="data-quality-indicator", style={
+                "position": "absolute",
+                "right": "20px",
+                "top": "50%",
+                "transform": "translateY(-50%)"
+            })
+        ], style={
+            "padding": "15px 20px",
+            "backgroundColor": "#ffffff",
+            "borderBottom": "1px solid #ecf0f1",
+            "position": "relative"
+        }),
+        
+        # Filters section - more compact
+        html.Div([
+            # Row 1: Core filters
+            html.Div([
+                # Date range
+                html.Div([
+                    html.Label("Date Range", style={
+                        "fontSize": "12px",
+                        "fontWeight": "600",
+                        "color": "#7f8c8d",
+                        "marginBottom": "4px"
+                    }),
+                    html.Div([
+                        dcc.Input(
+                            id="datetime-start",
+                            type="datetime-local",
+                            value=current_start.strftime("%Y-%m-%dT%H:%M") if current_start else "",
+                            style={
+                                "padding": "6px 10px",
+                                "fontSize": "13px",
+                                "border": "1px solid #dce1e7",
+                                "borderRadius": "4px",
+                                "marginRight": "8px"
+                            }
+                        ),
+                        html.Span("to", style={"margin": "0 8px", "color": "#95a5a6"}),
+                        dcc.Input(
+                            id="datetime-end",
+                            type="datetime-local",
+                            value=current_end.strftime("%Y-%m-%dT%H:%M") if current_end else "",
+                            style={
+                                "padding": "6px 10px",
+                                "fontSize": "13px",
+                                "border": "1px solid #dce1e7",
+                                "borderRadius": "4px"
+                            }
+                        )
+                    ], style={"display": "flex", "alignItems": "center"})
+                ], style={"marginRight": "24px"}),
+                
+                # Press filters
+                html.Div([
+                    html.Label("Press Row", style={
+                        "fontSize": "12px",
+                        "fontWeight": "600",
+                        "color": "#7f8c8d",
+                        "marginBottom": "4px"
+                    }),
+                    dcc.Dropdown(
+                        id="press-row-filter",
+                        options=[
+                            {"label": "All Rows", "value": "ALL"},
+                            {"label": "C & D", "value": "C&D"},
+                            {"label": "E, F & G", "value": "E,F&G"},
+                            {"label": "J & K", "value": "J&K"},
+                            {"label": "L & M", "value": "L&M"},
+                            {"label": "N & P", "value": "N&P"}
+                        ],
+                        value="ALL",
+                        clearable=False,
+                        style={"width": "120px", "fontSize": "13px"}
+                    )
+                ], style={"marginRight": "16px"}),
+                
+                html.Div([
+                    html.Label("Press ID", style={
+                        "fontSize": "12px",
+                        "fontWeight": "600",
+                        "color": "#7f8c8d",
+                        "marginBottom": "4px"
+                    }),
+                    dcc.Dropdown(
+                        id="press-filter",
+                        multi=True,
+                        placeholder="Select presses...",
+                        style={"width": "200px", "fontSize": "13px"}
+                    )
+                ], style={"marginRight": "16px"}),
+                
+                # Duration filter
+                html.Div([
+                    html.Label("Duration", style={
+                        "fontSize": "12px",
+                        "fontWeight": "600",
+                        "color": "#7f8c8d",
+                        "marginBottom": "4px"
+                    }),
+                    dcc.Dropdown(
+                        id="duration-filter",
+                        options=DURATION_OPTIONS,
+                        value=0,
+                        clearable=False,
+                        style={"width": "140px", "fontSize": "13px"}
+                    )
+                ], style={"marginRight": "16px"}),
+                
+                # Event status
+                html.Div([
+                    html.Label("Event Status", style={
+                        "fontSize": "12px",
+                        "fontWeight": "600",
+                        "color": "#7f8c8d",
+                        "marginBottom": "4px"
+                    }),
+                    dcc.Dropdown(
+                        id="event-status-filter",
+                        options=EVENT_STATUS_OPTIONS,
+                        value="all",
+                        clearable=False,
+                        style={"width": "140px", "fontSize": "13px"}
+                    )
+                ])
+            ], style={
+                "display": "flex",
+                "padding": "12px 20px",
+                "backgroundColor": "#f8f9fa",
+                "borderBottom": "1px solid #ecf0f1"
+            }),
+            
+            # Row 2: Action buttons - more compact
+            html.Div([
+                # Navigation buttons
+                html.Div([
+                    html.Button("← Previous", id="prev-shift-btn", n_clicks=0, style=BUTTON_STYLES["secondary"]),
+                    html.Button("Current Shift", id="current-shift-btn", n_clicks=0, style=BUTTON_STYLES["primary"]),
+                    html.Button("Next →", id="next-shift-btn", n_clicks=0, style=BUTTON_STYLES["secondary"])
+                ], style={"marginRight": "24px"}),
+                
+                # Action buttons
+                html.Div([
+                    html.Button([html.Span("🔄"), " Refresh"], id="refresh-btn", n_clicks=0, style=BUTTON_STYLES["info"]),
+                    html.Button([html.Span("💾"), " Save"], id="save-btn", n_clicks=0, style=BUTTON_STYLES["success"]),
+                    html.Button([html.Span("↩"), " Undo"], id="undo-btn", n_clicks=0, style=BUTTON_STYLES["secondary"]),
+                    html.Button([html.Span("↪"), " Redo"], id="redo-btn", n_clicks=0, style=BUTTON_STYLES["secondary"]),
+                    html.Button([html.Span("📊"), " Export"], id="export-btn", n_clicks=0, style=BUTTON_STYLES["secondary"]),
+                    html.Button([html.Span("✓"), " Validate"], id="validate-btn", n_clicks=0, style=BUTTON_STYLES["warning"]),
+                    html.Button([html.Span("🔨"), " Bulk Mode"], id="bulk-mode-btn", n_clicks=0, style=BUTTON_STYLES["info"])
+                ], style={"display": "flex", "gap": "8px"})
+            ], style={
+                "display": "flex",
+                "justifyContent": "space-between",
+                "padding": "10px 20px",
+                "backgroundColor": "#ffffff",
+                "borderBottom": "2px solid #ecf0f1"
+            })
+        ])
+    ], style={
+        "position": "sticky",
+        "top": "0",
+        "zIndex": "1000",
+        "height": "20vh",
+        "backgroundColor": "white",
+        "boxShadow": "0 2px 4px rgba(0,0,0,0.1)"
+    }),
+    
+    # Status bar - compact
+    html.Div([
+        html.Div(id="shift-info", style={"flex": "1"}),
+        html.Div(id="event-count", style={"flex": "1", "textAlign": "center"}),
+        html.Div(id="allocation-summary", style={"flex": "1", "textAlign": "right"})
+    ], style={
+        "display": "flex",
+        "padding": "8px 20px",
+        "backgroundColor": "#f8f9fa",
+        "fontSize": "13px",
+        "color": "#7f8c8d",
+        "borderBottom": "1px solid #ecf0f1"
+    }),
+    
+    # Alerts and validation - compact
+    html.Div([
+        html.Div(id="alerts", style={"marginBottom": "8px"}),
+        html.Div(id="validation-results"),
+        html.Div(id="bulk-actions", style={"display": "none"})
+    ], style={"padding": "0 20px"}),
+    
+    # Table container - 80% of space
+    html.Div(id="table-container", style={
+        "padding": "0",
+        "backgroundColor": "#f5f6fa",
+        "height": "calc(80vh - 20px)"
+    }),
+    
+    # Enhanced Modal
+    html.Div([
+        html.Div([
+            # Modal header
+            html.Div([
+                html.H3("Category Allocation", id="modal-title", style={
+                    "margin": "0",
+                    "fontSize": "20px",
+                    "fontWeight": "600",
+                    "color": "#2c3e50"
+                }),
+                html.Button("×", id="close-modal", n_clicks=0, style={
+                    "position": "absolute",
+                    "right": "15px",
+                    "top": "15px",
+                    "border": "none",
+                    "fontSize": "28px",
+                    "cursor": "pointer",
+                    "background": "none",
+                    "color": "#95a5a6"
+                })
+            ], style={
+                "padding": "20px",
+                "borderBottom": "1px solid #ecf0f1",
+                "position": "relative"
+            }),
+            
+            # Modal body
+            html.Div([
+                # Event info
+                html.Div([
+                    html.Div(id="modal-event-info", style={
+                        "fontSize": "14px",
+                        "color": "#7f8c8d",
+                        "marginBottom": "8px"
+                    }),
+                    html.Div(id="modal-duration-info", style={
+                        "fontSize": "18px",
+                        "fontWeight": "600",
+                        "color": "#2c3e50",
+                        "marginBottom": "20px"
+                    })
+                ]),
+                
+                # Progress visualization
+                html.Div([
+                    html.Div(id="modal-progress-text", style={
+                        "fontSize": "14px",
+                        "marginBottom": "8px",
+                        "color": "#7f8c8d"
+                    }),
+                    html.Div([
+                        html.Div(id="modal-progress-fill", style={
+                            "height": "8px",
+                            "backgroundColor": "#27ae60",
+                            "borderRadius": "4px",
+                            "transition": "width 0.3s ease"
+                        })
+                    ], style={
+                        "width": "100%",
+                        "height": "8px",
+                        "backgroundColor": "#ecf0f1",
+                        "borderRadius": "4px",
+                        "marginBottom": "24px"
+                    })
+                ]),
+                
+                # Quick templates
+                html.Div([
+                    html.H5("Quick Templates", style={
+                        "fontSize": "16px",
+                        "fontWeight": "600",
+                        "marginBottom": "12px",
+                        "color": "#2c3e50"
+                    }),
+                    html.Div(id="template-buttons", children=[
+                        html.Button(
+                            [html.Span(template["icon"]), f" {template['name']}"],
+                            id={"type": "template-btn", "template": template_key},
+                            n_clicks=0,
+                            style={**BUTTON_STYLES["template"], "marginRight": "8px", "marginBottom": "8px"}
+                        )
+                        for template_key, template in QUICK_ALLOCATION_TEMPLATES.items()
+                    ])
+                ], style={"marginBottom": "24px"}),
+                
+                # Current allocations
+                html.Div([
+                    html.H5("Current Allocations", style={
+                        "fontSize": "16px",
+                        "fontWeight": "600",
+                        "marginBottom": "12px",
+                        "color": "#2c3e50"
+                    }),
+                    html.Div(id="modal-current-allocations", style={
+                        "maxHeight": "200px",
+                        "overflowY": "auto",
+                        "marginBottom": "24px"
+                    })
+                ]),
+                
+                # Add new category
+                html.Div([
+                    html.H5("Add Category", style={
+                        "fontSize": "16px",
+                        "fontWeight": "600",
+                        "marginBottom": "12px",
+                        "color": "#2c3e50"
+                    }),
+                    html.Div([
+                        dcc.Dropdown(
+                            id="modal-category-dropdown",
+                            placeholder="Select category...",
+                            style={"width": "240px", "marginRight": "12px"}
+                        ),
+                        dcc.Input(
+                            id="modal-duration-input",
+                            type="number",
+                            placeholder="Minutes",
+                            min=1,
+                            style={
+                                "width": "100px",
+                                "padding": "8px",
+                                "marginRight": "12px",
+                                "border": "1px solid #dce1e7",
+                                "borderRadius": "4px"
+                            }
+                        ),
+                        html.Button("+ Add", id="modal-add-btn", n_clicks=0, style=BUTTON_STYLES["primary"])
+                    ], style={"display": "flex", "alignItems": "center"}),
+                    html.Div(id="modal-remaining-time", style={
+                        "marginTop": "8px",
+                        "fontSize": "14px",
+                        "color": "#95a5a6"
+                    })
+                ])
+            ], style={"padding": "20px", "maxHeight": "60vh", "overflowY": "auto"}),
+            
+            # Modal footer
+            html.Div([
+                html.Button("Save Changes", id="modal-save-btn", n_clicks=0, 
+                           style={**BUTTON_STYLES["success"], "marginRight": "12px"}),
+                html.Button("Cancel", id="modal-cancel-btn", n_clicks=0, 
+                           style=BUTTON_STYLES["secondary"])
+            ], style={
+                "padding": "20px",
+                "borderTop": "1px solid #ecf0f1",
+                "textAlign": "right",
+                "backgroundColor": "#f8f9fa"
+            })
+        ], style={
+            "backgroundColor": "white",
+            "borderRadius": "8px",
+            "boxShadow": "0 10px 40px rgba(0,0,0,0.2)",
+            "width": "600px",
+            "maxHeight": "90vh",
+            "overflow": "hidden"
+        })
+    ], id="allocation-modal", style={
+        "position": "fixed",
+        "top": "50%",
+        "left": "50%",
+        "transform": "translate(-50%, -50%)",
+        "zIndex": "2000",
+        "display": "none"
+    }),
+    
+    # Modal backdrop
+    html.Div(id="modal-backdrop", style={
+        "position": "fixed",
+        "top": "0",
+        "left": "0",
+        "width": "100%",
+        "height": "100%",
+        "backgroundColor": "rgba(0, 0, 0, 0.5)",
+        "zIndex": "1999",
+        "display": "none"
+    }),
+    
+    # Hidden stores
+    dcc.Store(id="data-version"),
+    dcc.Store(id="current-filters"),
+    dcc.Store(id="modal-event-key"),
+    dcc.Store(id="modal-temp-allocations"),
+    dcc.Store(id="bulk-mode-active", data=False),
+    dcc.Store(id="selected-events", data=[]),
+    
+    # Intervals
+    dcc.Interval(id="auto-refresh", interval=CONFIG["intervals"]["auto_refresh"]),
+    dcc.Interval(id="auto-save", interval=CONFIG["intervals"]["auto_save"]),
+    
+    # Download component
+    dcc.Download(id="download-dataframe-csv"),
+    
+    # Keyboard shortcut handler
+    html.Div(id="keyboard-shortcuts"),
+    dcc.Interval(id="keyboard-interval", interval=1000, n_intervals=0, max_intervals=1)
+])
+
+# =============================================================================
+# Callbacks
+# =============================================================================
+
+# Add keyboard shortcuts
+app.clientside_callback(
+    """
+    function(n_intervals) {
+        if (n_intervals === 1) {
+            document.addEventListener('keydown', function(e) {
+                // Ctrl+S for save
+                if (e.ctrlKey && e.key === 's') {
+                    e.preventDefault();
+                    document.getElementById('save-btn').click();
+                }
+                // Ctrl+Z for undo
+                if (e.ctrlKey && e.key === 'z' && !e.shiftKey) {
+                    e.preventDefault();
+                    document.getElementById('undo-btn').click();
+                }
+                // Ctrl+Shift+Z for redo
+                if (e.ctrlKey && e.shiftKey && e.key === 'z') {
+                    e.preventDefault();
+                    document.getElementById('redo-btn').click();
+                }
+                // Ctrl+E for export
+                if (e.ctrlKey && e.key === 'e') {
+                    e.preventDefault();
+                    document.getElementById('export-btn').click();
+                }
+            });
+        }
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output('keyboard-shortcuts', 'children'),
+    Input('keyboard-interval', 'n_intervals')
+)
+
+# Update press options when row filter changes
+@app.callback(
+    Output("press-filter", "options"),
+    Input("press-row-filter", "value")
+)
+def update_press_options(row_filter):
+    return data_manager.get_press_options(row_filter)
+
+# Toggle bulk mode
+@app.callback(
+    [Output("bulk-mode-active", "data"),
+     Output("bulk-mode-btn", "children"),
+     Output("bulk-actions", "style"),
+     Output("bulk-actions", "children")],
+    [Input("bulk-mode-btn", "n_clicks")],
+    [State("bulk-mode-active", "data")]
+)
+def toggle_bulk_mode(n_clicks, is_active):
+    if n_clicks == 0:
+        raise PreventUpdate
+    
+    new_state = not is_active
+    
+    if new_state:
+        btn_text = [html.Span("✓"), " Exit Bulk Mode"]
+        actions_style = {"display": "block", "padding": "12px 20px", "backgroundColor": "#f8f9fa", "marginBottom": "12px"}
+        actions_content = html.Div([
+            html.Span("Bulk Actions: ", style={"fontWeight": "600", "marginRight": "12px"}),
+            html.Button("Apply Template", id="bulk-apply-template", n_clicks=0, 
+                       style={**BUTTON_STYLES["primary"], "marginRight": "8px"}),
+            html.Div([
+                dcc.Dropdown(
+                    id="bulk-template-select",
+                    options=[{"label": t["name"], "value": k} for k, t in QUICK_ALLOCATION_TEMPLATES.items()],
+                    placeholder="Select template...",
+                    style={"width": "200px", "marginRight": "8px"}
+                )
+            ], style={"display": "inline-block", "verticalAlign": "middle"})
+        ], style={"display": "flex", "alignItems": "center"})
+    else:
+        btn_text = [html.Span("🔨"), " Bulk Mode"]
+        actions_style = {"display": "none"}
+        actions_content = None
+    
+    return new_state, btn_text, actions_style, actions_content
+
+# Main table update
+@app.callback(
+    [Output("table-container", "children"),
+     Output("shift-info", "children"),
+     Output("event-count", "children"),
+     Output("allocation-summary", "children"),
+     Output("alerts", "children"),
+     Output("data-version", "data"),
+     Output("current-filters", "data"),
+     Output("data-quality-indicator", "children")],
+    [Input("datetime-start", "value"),
+     Input("datetime-end", "value"),
+     Input("press-row-filter", "value"),
+     Input("press-filter", "value"),
+     Input("duration-filter", "value"),
+     Input("event-status-filter", "value"),
+     Input("refresh-btn", "n_clicks"),
+     Input("data-version", "data"),
+     Input("bulk-mode-active", "data")]
+)
+def update_table(start_date, end_date, press_row, press_ids, duration_threshold, 
+                event_status, refresh_clicks, data_version, bulk_mode):
+    
+    # Get filtered data
+    df = data_manager.get_filtered_data(
+        start_date, end_date, press_row, press_ids, 
+        duration_threshold, event_status
+    )
+    
+    # Build table
+    table = build_table(df, bulk_mode)
+    
+    # Shift info
+    if start_date and end_date:
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+        _, _, shift = get_shift_from_datetime(start_dt)
+        shift_config = CONFIG["shifts"].get(shift, {})
+        shift_info = f"🕐 {shift_config.get('name', 'Unknown')} | {start_dt.strftime('%m/%d %H:%M')} - {end_dt.strftime('%H:%M')}"
+    else:
+        shift_info = "🕐 No date range selected"
+    
+    # Event count
+    total_events = len(df)
+    ongoing_events = len(df[df['parsed_end'] == pd.Timestamp.max]) if 'parsed_end' in df.columns else 0
+    event_count = f"📊 Events: {total_events} total | {ongoing_events} ongoing"
+    
+    # Allocation summary
+    summary = data_manager.get_allocation_summary()
+    if summary:
+        allocation_summary = (
+            f"📈 Allocated: {summary['fully_allocated']}/{summary['total_events']} complete | "
+            f"{summary['overall_allocation_percentage']:.0f}% time coverage"
+        )
+    else:
+        allocation_summary = "📈 No allocation data"
+    
+    # Alerts
+    alerts = []
+    if data_manager.pending_changes:
+        alerts.append(
+            html.Div([
+                html.Span("⚠️", style={"fontSize": "16px", "marginRight": "8px"}),
+                "Unsaved changes - Press Ctrl+S to save"
+            ], style={
+                "backgroundColor": "#fff3cd",
+                "color": "#856404",
+                "padding": "8px 12px",
+                "borderRadius": "4px",
+                "fontSize": "13px",
+                "display": "inline-flex",
+                "alignItems": "center"
+            })
+        )
+    
+    # Data quality indicator
+    quality_score = data_manager.calculate_data_quality_score()
+    quality_color = "#27ae60" if quality_score['overall_score'] >= 80 else "#f39c12" if quality_score['overall_score'] >= 60 else "#e74c3c"
+    
+    quality_indicator = html.Div([
+        html.Div("Data Quality", style={"fontSize": "11px", "color": "#7f8c8d", "marginBottom": "2px"}),
+        html.Div([
+            html.Div(style={
+                "width": f"{quality_score['overall_score']}%",
+                "height": "4px",
+                "backgroundColor": quality_color,
+                "borderRadius": "2px"
+            })
+        ], style={
+            "width": "100px",
+            "height": "4px",
+            "backgroundColor": "#ecf0f1",
+            "borderRadius": "2px"
+        }),
+        html.Div(f"{quality_score['overall_score']:.0f}%", style={
+            "fontSize": "12px",
+            "fontWeight": "600",
+            "color": quality_color,
+            "marginTop": "2px"
+        })
+    ])
+    
+    # Store current filters
+    current_filters = {
+        "start_date": start_date,
+        "end_date": end_date,
+        "press_row": press_row,
+        "press_ids": press_ids,
+        "duration_threshold": duration_threshold,
+        "event_status": event_status
+    }
+    
+    return table, shift_info, event_count, allocation_summary, alerts, data_manager.data_version, current_filters, quality_indicator
+
+# Handle modal open/close
+@app.callback(
+    [Output("allocation-modal", "style"),
+     Output("modal-backdrop", "style"),
+     Output("modal-event-key", "data"),
+     Output("modal-title", "children"),
+     Output("modal-event-info", "children"),
+     Output("modal-duration-info", "children"),
+     Output("modal-current-allocations", "children"),
+     Output("modal-progress-text", "children"),
+     Output("modal-progress-fill", "style"),
+     Output("modal-category-dropdown", "options"),
+     Output("modal-duration-input", "max"),
+     Output("modal-remaining-time", "children"),
+     Output("modal-temp-allocations", "data")],
+    [Input({"type": "open-modal-btn", "index": ALL}, "n_clicks"),
+     Input("close-modal", "n_clicks"),
+     Input("modal-cancel-btn", "n_clicks")],
+    [State({"type": "open-modal-btn", "index": ALL}, "id")]
+)
+def handle_modal_display(open_clicks, close_clicks, cancel_clicks, button_ids):
+    if not ctx.triggered:
+        raise PreventUpdate
+    
+    triggered_id = ctx.triggered[0]['prop_id']
+    
+    # Handle close or cancel
+    if "close-modal" in triggered_id or "modal-cancel-btn" in triggered_id:
+        return ({"display": "none"}, {"display": "none"}, None, "", "", "", [], "", 
+                {"width": "0%", "height": "8px", "backgroundColor": "#27ae60", 
+                 "borderRadius": "4px", "transition": "width 0.3s ease"}, 
+                [], 0, "", {})
+    
+    # Handle open
+    if any(open_clicks):
+        changed_id = ctx.triggered[0]['prop_id'].split('.')[0]
+        event_key = json.loads(changed_id)['index']
+        
+        # Get event data
+        event_data = data_manager.get_event_data(event_key)
+        if not event_data:
+            raise PreventUpdate
+        
+        total_duration = event_data['total_duration']
+        cat_durations = event_data['category_durations']
+        allocated_duration = sum(cat_durations.values())
+        remaining_duration = total_duration - allocated_duration
+        allocation_percentage = (allocated_duration / total_duration * 100) if total_duration > 0 else 0
+        
+        # Create current allocations display
+        allocation_items = []
+        for cat_code, duration in cat_durations.items():
+            cat_info = next((c for c in EVENT_CATEGORIES if c["value"] == cat_code), None)
+            if cat_info:
+                item = html.Div([
+                    html.Div([
+                        html.Span("", style={
+                            "display": "inline-block",
+                            "width": "16px",
+                            "height": "16px",
+                            "backgroundColor": cat_info["color"],
+                            "borderRadius": "4px",
+                            "marginRight": "12px"
+                        }),
+                        html.Span(f"{cat_info['icon']} {cat_info['label']}", style={
+                            "fontWeight": "500",
+                            "flex": "1",
+                            "fontSize": "14px"
+                        }),
+                        html.Span(format_minutes(duration), style={
+                            "marginRight": "12px",
+                            "color": "#7f8c8d",
+                            "fontSize": "14px"
+                        }),
+                        html.Button("Remove", 
+                                   id={"type": "modal-remove-category", "category": cat_code},
+                                   n_clicks=0,
+                                   style={**BUTTON_STYLES["warning"], "fontSize": "12px", "padding": "4px 10px"})
+                    ], style={
+                        "display": "flex",
+                        "alignItems": "center",
+                        "padding": "8px",
+                        "backgroundColor": "#f8f9fa",
+                        "borderRadius": "4px",
+                        "marginBottom": "8px"
+                    })
+                ])
+                allocation_items.append(item)
+        
+        if not allocation_items:
+            allocation_items = [html.Div("No categories allocated yet", 
+                                       style={"color": "#95a5a6", "fontStyle": "italic", "padding": "20px", "textAlign": "center"})]
+        
+        # Available categories
+        allocated_codes = list(cat_durations.keys())
+        available_categories = [
+            {"label": f"{cat['icon']} {cat['label']}", "value": cat["value"]} 
+            for cat in EVENT_CATEGORIES if cat["value"] not in allocated_codes
+        ]
+        
+        # Progress bar color
+        progress_color = "#27ae60" if allocation_percentage >= 100 else "#f39c12" if allocation_percentage >= 50 else "#e74c3c"
+        
+        # Event info
+        event_info = f"Press: {event_data['press_id']} | Started: {event_data['start_time'].strftime('%m/%d %H:%M') if hasattr(event_data['start_time'], 'strftime') else 'N/A'}"
+        if event_data['is_ongoing']:
+            event_info += " | Status: 🔴 Ongoing"
+        
+        return (
+            {"display": "block"},
+            {"display": "block"},
+            event_key,
+            f"Category Allocation - {event_key}",
+            event_info,
+            f"Total Duration: {format_minutes(total_duration)}",
+            allocation_items,
+            f"Allocation Progress: {allocation_percentage:.0f}% ({format_minutes(allocated_duration)} of {format_minutes(total_duration)})",
+            {"width": f"{min(allocation_percentage, 100)}%", "height": "8px", "backgroundColor": progress_color, 
+             "borderRadius": "4px", "transition": "width 0.3s ease"},
+            available_categories,
+            remaining_duration,
+            f"⏱️ Remaining: {format_minutes(remaining_duration)}",
+            cat_durations
+        )
+    
+    raise PreventUpdate
+
+# Handle template application in modal
+@app.callback(
+    Output("modal-temp-allocations", "data", allow_duplicate=True),
+    [Input({"type": "template-btn", "template": ALL}, "n_clicks")],
+    [State("modal-event-key", "data"),
+     State({"type": "template-btn", "template": ALL}, "id")],
+    prevent_initial_call=True
+)
+def handle_template_click(n_clicks_list, event_key, template_ids):
+    if not any(n_clicks_list) or not event_key:
+        raise PreventUpdate
+    
+    # Find which template was clicked
+    for i, n_clicks in enumerate(n_clicks_list):
+        if n_clicks > 0:
+            template_key = template_ids[i]['template']
+            break
+    else:
+        raise PreventUpdate
+    
+    # Get event data
+    event_data = data_manager.get_event_data(event_key)
+    if not event_data:
+        raise PreventUpdate
+    
+    # Apply template
+    template = QUICK_ALLOCATION_TEMPLATES[template_key]
+    total_duration = event_data['total_duration']
+    
+    new_allocations = {
+        cat: total_duration * percentage 
+        for cat, percentage in template['allocations'].items()
+    }
+    
+    return new_allocations
+
+# Handle adding category in modal
+@app.callback(
+    [Output("modal-temp-allocations", "data", allow_duplicate=True),
+     Output("modal-current-allocations", "children", allow_duplicate=True),
+     Output("modal-progress-text", "children", allow_duplicate=True),
+     Output("modal-progress-fill", "style", allow_duplicate=True),
+     Output("modal-category-dropdown", "options", allow_duplicate=True),
+     Output("modal-duration-input", "max", allow_duplicate=True),
+     Output("modal-remaining-time", "children", allow_duplicate=True),
+     Output("modal-category-dropdown", "value"),
+     Output("modal-duration-input", "value")],
+    [Input("modal-add-btn", "n_clicks")],
+    [State("modal-category-dropdown", "value"),
+     State("modal-duration-input", "value"),
+     State("modal-event-key", "data"),
+     State("modal-temp-allocations", "data")],
+    prevent_initial_call=True
+)
+def handle_modal_add_category(n_clicks, category, duration, event_key, temp_allocations):
+    if not n_clicks or not category or not duration or not event_key:
+        raise PreventUpdate
+    
+    # Get event data
+    event_data = data_manager.get_event_data(event_key)
+    if not event_data:
+        raise PreventUpdate
+        
+    total_duration = event_data['total_duration']
+    
+    # Update temp allocations
+    if not temp_allocations:
+        temp_allocations = {}
+    
+    temp_allocations[category] = temp_allocations.get(category, 0) + duration
+    
+    # Calculate new totals
+    allocated_duration = sum(temp_allocations.values())
+    remaining_duration = total_duration - allocated_duration
+    allocation_percentage = (allocated_duration / total_duration * 100) if total_duration > 0 else 0
+    
+    # Create updated allocations display
+    allocation_items = []
+    for cat_code, dur in temp_allocations.items():
+        cat_info = next((c for c in EVENT_CATEGORIES if c["value"] == cat_code), None)
+        if cat_info:
+            item = html.Div([
+                html.Div([
+                    html.Span("", style={
+                        "display": "inline-block",
+                        "width": "16px",
+                        "height": "16px",
+                        "backgroundColor": cat_info["color"],
+                        "borderRadius": "4px",
+                        "marginRight": "12px"
+                    }),
+                    html.Span(f"{cat_info['icon']} {cat_info['label']}", style={
+                        "fontWeight": "500",
+                        "flex": "1",
+                        "fontSize": "14px"
+                    }),
+                    html.Span(format_minutes(dur), style={
+                        "marginRight": "12px",
+                        "color": "#7f8c8d",
+                        "fontSize": "14px"
+                    }),
+                    html.Button("Remove", 
+                               id={"type": "modal-remove-category", "category": cat_code},
+                               n_clicks=0,
+                               style={**BUTTON_STYLES["warning"], "fontSize": "12px", "padding": "4px 10px"})
+                ], style={
+                    "display": "flex",
+                    "alignItems": "center",
+                    "padding": "8px",
+                    "backgroundColor": "#f8f9fa",
+                    "borderRadius": "4px",
+                    "marginBottom": "8px"
+                })
+            ])
+            allocation_items.append(item)
+    
+    # Available categories
+    allocated_codes = list(temp_allocations.keys())
+    available_categories = [
+        {"label": f"{cat['icon']} {cat['label']}", "value": cat["value"]} 
+        for cat in EVENT_CATEGORIES if cat["value"] not in allocated_codes
+    ]
+    
+    # Progress bar color
+    progress_color = "#27ae60" if allocation_percentage >= 100 else "#f39c12" if allocation_percentage >= 50 else "#e74c3c"
+    
+    return (
+        temp_allocations,
+        allocation_items,
+        f"Allocation Progress: {allocation_percentage:.0f}% ({format_minutes(allocated_duration)} of {format_minutes(total_duration)})",
+        {"width": f"{min(allocation_percentage, 100)}%", "height": "8px", "backgroundColor": progress_color, 
+         "borderRadius": "4px", "transition": "width 0.3s ease"},
+        available_categories,
+        max(0, remaining_duration),
+        f"⏱️ Remaining: {format_minutes(max(0, remaining_duration))}",
+        None,  # Clear dropdown
+        None   # Clear input
+    )
+
+# Handle removing category in modal
+@app.callback(
+    [Output("modal-temp-allocations", "data", allow_duplicate=True),
+     Output("modal-current-allocations", "children", allow_duplicate=True),
+     Output("modal-progress-text", "children", allow_duplicate=True),
+     Output("modal-progress-fill", "style", allow_duplicate=True),
+     Output("modal-category-dropdown", "options", allow_duplicate=True),
+     Output("modal-duration-input", "max", allow_duplicate=True),
+     Output("modal-remaining-time", "children", allow_duplicate=True)],
+    [Input({"type": "modal-remove-category", "category": ALL}, "n_clicks")],
+    [State("modal-event-key", "data"),
+     State("modal-temp-allocations", "data")],
+    prevent_initial_call=True
+)
+def handle_modal_remove_category(n_clicks_list, event_key, temp_allocations):
+    if not any(n_clicks_list) or not event_key:
+        raise PreventUpdate
+    
+    # Find which button was clicked
+    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    category_to_remove = json.loads(triggered_id)['category']
+    
+    # Get event data
+    event_data = data_manager.get_event_data(event_key)
+    if not event_data:
+        raise PreventUpdate
+        
+    total_duration = event_data['total_duration']
+    
+    # Remove from temp allocations
+    if temp_allocations and category_to_remove in temp_allocations:
+        del temp_allocations[category_to_remove]
+    
+    # Calculate new totals
+    allocated_duration = sum(temp_allocations.values()) if temp_allocations else 0
+    remaining_duration = total_duration - allocated_duration
+    allocation_percentage = (allocated_duration / total_duration * 100) if total_duration > 0 else 0
+    
+    # Create updated allocations display
+    allocation_items = []
+    if temp_allocations:
+        for cat_code, dur in temp_allocations.items():
+            cat_info = next((c for c in EVENT_CATEGORIES if c["value"] == cat_code), None)
+            if cat_info:
+                item = html.Div([
+                    html.Div([
+                        html.Span("", style={
+                            "display": "inline-block",
+                            "width": "16px",
+                            "height": "16px",
+                            "backgroundColor": cat_info["color"],
+                            "borderRadius": "4px",
+                            "marginRight": "12px"
+                        }),
+                        html.Span(f"{cat_info['icon']} {cat_info['label']}", style={
+                            "fontWeight": "500",
+                            "flex": "1",
+                            "fontSize": "14px"
+                        }),
+                        html.Span(format_minutes(dur), style={
+                            "marginRight": "12px",
+                            "color": "#7f8c8d",
+                            "fontSize": "14px"
+                        }),
+                        html.Button("Remove", 
+                                   id={"type": "modal-remove-category", "category": cat_code},
+                                   n_clicks=0,
+                                   style={**BUTTON_STYLES["warning"], "fontSize": "12px", "padding": "4px 10px"})
+                    ], style={
+                        "display": "flex",
+                        "alignItems": "center",
+                        "padding": "8px",
+                        "backgroundColor": "#f8f9fa",
+                        "borderRadius": "4px",
+                        "marginBottom": "8px"
+                    })
+                ])
+                allocation_items.append(item)
+    else:
+        allocation_items = [html.Div("No categories allocated yet", 
+                                   style={"color": "#95a5a6", "fontStyle": "italic", "padding": "20px", "textAlign": "center"})]
+    
+    # Available categories
+    allocated_codes = list(temp_allocations.keys()) if temp_allocations else []
+    available_categories = [
+        {"label": f"{cat['icon']} {cat['label']}", "value": cat["value"]} 
+        for cat in EVENT_CATEGORIES if cat["value"] not in allocated_codes
+    ]
+    
+    # Progress bar color
+    progress_color = "#27ae60" if allocation_percentage >= 100 else "#f39c12" if allocation_percentage >= 50 else "#e74c3c"
+    
+    return (
+        temp_allocations or {},
+        allocation_items,
+        f"Allocation Progress: {allocation_percentage:.0f}% ({format_minutes(allocated_duration)} of {format_minutes(total_duration)})",
+        {"width": f"{min(allocation_percentage, 100)}%", "height": "8px", "backgroundColor": progress_color, 
+         "borderRadius": "4px", "transition": "width 0.3s ease"},
+        available_categories,
+        remaining_duration,
+        f"⏱️ Remaining: {format_minutes(remaining_duration)}"
+    )
+
+# Handle saving modal changes
+@app.callback(
+    [Output("data-version", "data", allow_duplicate=True),
+     Output("allocation-modal", "style", allow_duplicate=True),
+     Output("modal-backdrop", "style", allow_duplicate=True),
+     Output("alerts", "children", allow_duplicate=True)],
+    [Input("modal-save-btn", "n_clicks")],
+    [State("modal-event-key", "data"),
+     State("modal-temp-allocations", "data")],
+    prevent_initial_call=True
+)
+def handle_modal_save(n_clicks, event_key, temp_allocations):
+    if not n_clicks or not event_key:
+        raise PreventUpdate
+    
+    try:
+        # Update the data
+        data_manager.update_category_durations(event_key, temp_allocations or {}, f"Updated allocations for {event_key}")
+        
+        # Close modal
+        return (
+            data_manager.data_version,
+            {"display": "none"},
+            {"display": "none"},
+            html.Div([
+                html.Span("✓", style={"fontSize": "16px", "marginRight": "8px"}),
+                f"Updated allocations for {event_key}"
+            ], style={
+                "backgroundColor": "#d4edda",
+                "color": "#155724",
+                "padding": "8px 12px",
+                "borderRadius": "4px",
+                "fontSize": "13px",
+                "display": "inline-flex",
+                "alignItems": "center"
+            })
+        )
+    except Exception as e:
+        # Show error but don't close modal
+        return (
+            data_manager.data_version,
+            {"display": "block"},
+            {"display": "block"},
+            html.Div([
+                html.Span("❌", style={"fontSize": "16px", "marginRight": "8px"}),
+                str(e)
+            ], style={
+                "backgroundColor": "#f8d7da",
+                "color": "#721c24",
+                "padding": "8px 12px",
+                "borderRadius": "4px",
+                "fontSize": "13px",
+                "display": "inline-flex",
+                "alignItems": "center"
+            })
+        )
+
+# Handle comment updates
+@app.callback(
+    Output("data-version", "data", allow_duplicate=True),
+    [Input({"type": "comment", "index": ALL}, "value")],
+    [State({"type": "comment", "index": ALL}, "id")],
+    prevent_initial_call=True
+)
+def handle_comment_updates(comments, comment_ids):
+    if not ctx.triggered:
+        raise PreventUpdate
+    
+    # Find which comment was changed
+    changed_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    comment_index = json.loads(changed_id)['index']
+    
+    # Get the new comment value
+    for i, comment_id in enumerate(comment_ids):
+        if comment_id['index'] == comment_index:
+            new_comment = comments[i]
+            break
+    else:
+        raise PreventUpdate
+    
+    # Update the data
+    data_manager.update_data(comment_index, "Comment", new_comment, f"Updated comment for {comment_index}")
+    
+    return data_manager.data_version
+
+# Handle shift navigation
+@app.callback(
+    [Output("datetime-start", "value"),
+     Output("datetime-end", "value")],
+    [Input("prev-shift-btn", "n_clicks"),
+     Input("current-shift-btn", "n_clicks"),
+     Input("next-shift-btn", "n_clicks")],
+    [State("datetime-start", "value")]
+)
+def handle_shift_navigation(prev_clicks, current_clicks, next_clicks, current_start):
+    if not ctx.triggered:
+        raise PreventUpdate
+    
+    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    if button_id == "current-shift-btn":
+        start, end, _ = get_current_shift_range()
+    else:
+        current_dt = pd.to_datetime(current_start) if current_start else datetime.datetime.now()
+        
+        if button_id == "prev-shift-btn":
+            start, end, _ = get_previous_shift(current_dt)
+        elif button_id == "next-shift-btn":
+            start, end, _ = get_next_shift(current_dt)
+        else:
+            raise PreventUpdate
+    
+    return start.strftime("%Y-%m-%dT%H:%M"), end.strftime("%Y-%m-%dT%H:%M")
+
+# Handle save button
+@app.callback(
+    Output("alerts", "children", allow_duplicate=True),
+    Input("save-btn", "n_clicks"),
+    prevent_initial_call=True
+)
+def handle_save(n_clicks):
+    if n_clicks == 0:
+        raise PreventUpdate
+    
+    if data_manager.safe_save_with_rollback():
+        return html.Div([
+            html.Span("✓", style={"fontSize": "16px", "marginRight": "8px"}),
+            f"Saved successfully at {datetime.datetime.now().strftime('%H:%M:%S')}"
+        ], style={
+            "backgroundColor": "#d4edda",
+            "color": "#155724",
+            "padding": "8px 12px",
+            "borderRadius": "4px",
+            "fontSize": "13px",
+            "display": "inline-flex",
+            "alignItems": "center"
+        })
+    else:
+        return html.Div([
+            html.Span("❌", style={"fontSize": "16px", "marginRight": "8px"}),
+            "Save failed - data rolled back"
+        ], style={
+            "backgroundColor": "#f8d7da",
+            "color": "#721c24",
+            "padding": "8px 12px",
+            "borderRadius": "4px",
+            "fontSize": "13px",
+            "display": "inline-flex",
+            "alignItems": "center"
+        })
+
+# Handle undo/redo
+@app.callback(
+    [Output("data-version", "data", allow_duplicate=True),
+     Output("alerts", "children", allow_duplicate=True)],
+    [Input("undo-btn", "n_clicks"),
+     Input("redo-btn", "n_clicks")],
+    prevent_initial_call=True
+)
+def handle_undo_redo(undo_clicks, redo_clicks):
+    if not ctx.triggered:
+        raise PreventUpdate
+    
+    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    if button_id == "undo-btn":
+        if data_manager.undo():
+            return data_manager.data_version, html.Div([
+                html.Span("↩", style={"fontSize": "16px", "marginRight": "8px"}),
+                "Undo successful"
+            ], style={
+                "backgroundColor": "#cfe2ff",
+                "color": "#084298",
+                "padding": "8px 12px",
+                "borderRadius": "4px",
+                "fontSize": "13px",
+                "display": "inline-flex",
+                "alignItems": "center"
+            })
+        else:
+            return data_manager.data_version, html.Div([
+                html.Span("ℹ", style={"fontSize": "16px", "marginRight": "8px"}),
+                "Nothing to undo"
+            ], style={
+                "backgroundColor": "#f8d7da",
+                "color": "#721c24",
+                "padding": "8px 12px",
+                "borderRadius": "4px",
+                "fontSize": "13px",
+                "display": "inline-flex",
+                "alignItems": "center"
+            })
+    
+    elif button_id == "redo-btn":
+        if data_manager.redo():
+            return data_manager.data_version, html.Div([
+                html.Span("↪", style={"fontSize": "16px", "marginRight": "8px"}),
+                "Redo successful"
+            ], style={
+                "backgroundColor": "#cfe2ff",
+                "color": "#084298",
+                "padding": "8px 12px",
+                "borderRadius": "4px",
+                "fontSize": "13px",
+                "display": "inline-flex",
+                "alignItems": "center"
+            })
+        else:
+            return data_manager.data_version, html.Div([
+                html.Span("ℹ", style={"fontSize": "16px", "marginRight": "8px"}),
+                "Nothing to redo"
+            ], style={
+                "backgroundColor": "#f8d7da",
+                "color": "#721c24",
+                "padding": "8px 12px",
+                "borderRadius": "4px",
+                "fontSize": "13px",
+                "display": "inline-flex",
+                "alignItems": "center"
+            })
+    
+    raise PreventUpdate
+
+# Handle validation
+@app.callback(
+    Output("validation-results", "children"),
+    Input("validate-btn", "n_clicks"),
+    prevent_initial_call=True
+)
+def handle_validation(n_clicks):
+    if n_clicks == 0:
+        raise PreventUpdate
+    
+    validation_messages = data_manager.validate_durations()
+    
+    if not validation_messages:
+        return html.Div([
+            html.Div([
+                html.Span("✓", style={"fontSize": "20px", "marginRight": "8px"}),
+                "All allocations are valid!"
+            ], style={
+                "display": "flex",
+                "alignItems": "center",
+                "fontSize": "14px",
+                "fontWeight": "500"
+            })
+        ], style={
+            "backgroundColor": "#d4edda",
+            "color": "#155724",
+            "padding": "12px 16px",
+            "borderRadius": "4px",
+            "marginBottom": "12px"
+        })
+    
+    # Group messages by type
+    errors = [msg for msg in validation_messages if msg.startswith("❌")]
+    warnings = [msg for msg in validation_messages if msg.startswith("⚠️")]
+    
+    # Limit displayed messages
+    max_display = 10
+    display_content = []
+    
+    if errors:
+        display_content.append(
+            html.Div([
+                html.H6(f"Errors ({len(errors)})", style={"margin": "0 0 8px 0", "color": "#721c24"}),
+                html.Div([
+                    html.Div(error, style={"fontSize": "12px", "marginBottom": "4px"})
+                    for error in errors[:max_display]
+                ]),
+                html.Div(f"... and {len(errors) - max_display} more", 
+                        style={"fontSize": "11px", "fontStyle": "italic", "color": "#721c24"})
+                if len(errors) > max_display else None
+            ])
+        )
+    
+    if warnings:
+        display_content.append(
+            html.Div([
+                html.H6(f"Warnings ({len(warnings)})", style={"margin": "12px 0 8px 0", "color": "#856404"}),
+                html.Div([
+                    html.Div(warning, style={"fontSize": "12px", "marginBottom": "4px"})
+                    for warning in warnings[:max_display]
+                ]),
+                html.Div(f"... and {len(warnings) - max_display} more", 
+                        style={"fontSize": "11px", "fontStyle": "italic", "color": "#856404"})
+                if len(warnings) > max_display else None
+            ])
+        )
+    
+    return html.Div(display_content, style={
+        "backgroundColor": "#fff3cd" if not errors else "#f8d7da",
+        "padding": "12px 16px",
+        "borderRadius": "4px",
+        "marginBottom": "12px",
+        "maxHeight": "300px",
+        "overflowY": "auto"
+    })
+
+# Handle export
+@app.callback(
+    Output("download-dataframe-csv", "data"),
+    Input("export-btn", "n_clicks"),
+    [State("current-filters", "data")],
+    prevent_initial_call=True
+)
+def handle_export(n_clicks, filters):
+    if n_clicks == 0:
+        raise PreventUpdate
+    
+    # Re-apply filters to get current view
+    if filters:
+        df = data_manager.get_filtered_data(
+            filters.get("start_date"),
+            filters.get("end_date"),
+            filters.get("press_row"),
+            filters.get("press_ids"),
+            filters.get("duration_threshold"),
+            filters.get("event_status")
+        )
+    else:
+        df = data_manager.view_df
+    
+    if df is None or df.empty:
+        raise PreventUpdate
+    
+    # Prepare export dataframe
+    export_df = df.copy()
+    
+    # Add readable columns
+    export_df['Is_Ongoing'] = export_df['parsed_end'].apply(
+        lambda x: 'Yes' if x == pd.Timestamp.max else 'No'
+    )
+    
+    export_df['Event_Status'] = export_df.get('shift_status', 'current').apply(
+        lambda x: 'Carryover' if x == 'carryover' else 'Current'
+    )
+    
+    export_df['Allocation_Status'] = export_df.apply(
+        lambda row: 'Fully Allocated' if row.get('Allocation_Percentage', 0) >= 100 
+        else 'Partially Allocated' if row.get('Allocation_Percentage', 0) > 0 
+        else 'Unallocated',
+        axis=1
+    )
+    
+    # Remove internal columns
+    internal_cols = ['parsed_start', 'parsed_end', 'shift_status', 
+                    'Duration_Display', 'has_allocation', '_parsed_start', '_parsed_end']
+    export_cols = [col for col in export_df.columns if col not in internal_cols]
+    
+    # Reorder columns for better readability
+    priority_cols = ['Press_ID', 'StartTime EST', 'EndTime EST', 'Duration', 
+                    'Calculated_Duration', 'Categories', 'Category_Durations', 
+                    'Comment', 'Is_Ongoing', 'Event_Status', 'Allocation_Status',
+                    'Allocated_Duration', 'Remaining_Duration', 'Allocation_Percentage']
+    
+    final_cols = [col for col in priority_cols if col in export_cols]
+    remaining_cols = [col for col in export_cols if col not in final_cols]
+    
+    export_df = export_df[final_cols + remaining_cols]
+    
+    # Add timestamp to filename
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"event_categorization_{timestamp}.csv"
+    
+    return dcc.send_data_frame(export_df.to_csv, filename, index=False)
+
+# Handle bulk template application
+@app.callback(
+    [Output("alerts", "children", allow_duplicate=True),
+     Output("data-version", "data", allow_duplicate=True)],
+    [Input("bulk-apply-template", "n_clicks")],
+    [State("bulk-template-select", "value"),
+     State("selected-events", "data")],
+    prevent_initial_call=True
+)
+def handle_bulk_template_apply(n_clicks, template_key, selected_events):
+    if not n_clicks or not template_key or not selected_events:
+        raise PreventUpdate
+    
+    success_count, errors = data_manager.bulk_update_category_durations(selected_events, template_key)
+    
+    if success_count > 0:
+        message = f"✓ Applied template to {success_count} events"
+        if errors:
+            message += f" ({len(errors)} errors)"
+        
+        return html.Div([
+            html.Span("✓", style={"fontSize": "16px", "marginRight": "8px"}),
+            message
+        ], style={
+            "backgroundColor": "#d4edda",
+            "color": "#155724",
+            "padding": "8px 12px",
+            "borderRadius": "4px",
+            "fontSize": "13px",
+            "display": "inline-flex",
+            "alignItems": "center"
+        }), data_manager.data_version
+    else:
+        return html.Div([
+            html.Span("❌", style={"fontSize": "16px", "marginRight": "8px"}),
+            "Failed to apply template"
+        ], style={
+            "backgroundColor": "#f8d7da",
+            "color": "#721c24",
+            "padding": "8px 12px",
+            "borderRadius": "4px",
+            "fontSize": "13px",
+            "display": "inline-flex",
+            "alignItems": "center"
+        }), data_manager.data_version
+
+# Handle event selection for bulk mode
+@app.callback(
+    Output("selected-events", "data"),
+    [Input({"type": "event-select", "index": ALL}, "value"),
+     Input("select-all-events", "value")],
+    [State({"type": "event-select", "index": ALL}, "id")],
+    prevent_initial_call=True
+)
+def handle_event_selection(individual_selections, select_all, event_ids):
+    if ctx.triggered[0]['prop_id'] == 'select-all-events.value':
+        if "all" in select_all:
+            # Select all events
+            return [event_id['index'] for event_id in event_ids]
+        else:
+            # Deselect all
+            return []
+    else:
+        # Individual selection
+        selected = []
+        for i, selection in enumerate(individual_selections):
+            if selection:
+                selected.extend(selection)
+        return selected
+
+# Auto-refresh
+@app.callback(
+    Output("data-version", "data", allow_duplicate=True),
+    Input("auto-refresh", "n_intervals"),
+    prevent_initial_call=True
+)
+def auto_refresh(n_intervals):
+    print(f"Auto-refresh triggered at {datetime.datetime.now()}")
+    if data_manager.load_data():
+        return data_manager.data_version
+    raise PreventUpdate
+
+# Auto-save
+@app.callback(
+    Output("alerts", "children", allow_duplicate=True),
+    Input("auto-save", "n_intervals"),
+    prevent_initial_call=True
+)
+def auto_save(n_intervals):
+    if data_manager.pending_changes:
+        if data_manager.safe_save_with_rollback():
+            print(f"Auto-save successful at {datetime.datetime.now()}")
+            return html.Div([
+                html.Span("💾", style={"fontSize": "16px", "marginRight": "8px"}),
+                f"Auto-saved at {datetime.datetime.now().strftime('%H:%M:%S')}"
+            ], style={
+                "backgroundColor": "#d1ecf1",
+                "color": "#0c5460",
+                "padding": "8px 12px",
+                "borderRadius": "4px",
+                "fontSize": "13px",
+                "display": "inline-flex",
+                "alignItems": "center"
+            })
+    raise PreventUpdate
+
+
+
+# =============================================================================
+# End of Application
+# =============================================================================
+print("\n" + "="*60)
+print("✅ Enhanced application setup complete!")
+print(f"📅 Current Date/Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+print("🚀 Key improvements implemented:")
+print("   • Compact header design (20% space)")
+print("   • Enhanced modal with templates")
+print("   • Improved error handling")
+print("   • Bulk operations support")
+print("   • Better visual feedback")
+print("   • Keyboard shortcuts (Ctrl+S, Ctrl+Z, etc.)")
+print("   • Data quality indicators")
+print("   • Smart validation")
+print("   • All styling done inline (no html.Style)")
+print("="*60 + "\n")
