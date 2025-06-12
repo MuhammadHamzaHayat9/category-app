@@ -1276,7 +1276,9 @@ def build_table(df, bulk_mode=False):
         "backgroundColor": "#ffffff",
         "borderRadius": "8px"
     })
-
+print("=== TABLE DEBUG ===")
+print(f"Number of rows: {len(df)}")
+print(f"Bulk mode: {bulk_mode}")
 # =============================================================================
 # Initialize
 # =============================================================================
@@ -1700,6 +1702,7 @@ app.layout = html.Div([
     
     # Download component
     dcc.Download(id="download-dataframe-csv"),
+    dcc.Store(id="debug-store"),
     
     # Keyboard shortcut handler
     html.Div(id="keyboard-shortcuts"),
@@ -2747,7 +2750,19 @@ def auto_save(n_intervals):
             })
     raise PreventUpdate
 
-
+@app.callback(
+    Output("debug-store", "data"),  # You'll need to add this store to your layout
+    Input({"type": "edit-allocation", "index": ALL}, "n_clicks"),
+    State({"type": "edit-allocation", "index": ALL}, "id"),
+    prevent_initial_call=True
+)
+def debug_edit_clicks(n_clicks, ids):
+    print("=== EDIT BUTTON DEBUG ===")
+    print(f"Clicks: {n_clicks}")
+    print(f"IDs: {ids}")
+    print(f"Triggered: {ctx.triggered}")
+    print(f"Triggered ID: {ctx.triggered_id}")
+    return {"debug": "clicked", "time": str(datetime.datetime.now())}
 
 # =============================================================================
 # End of Application
